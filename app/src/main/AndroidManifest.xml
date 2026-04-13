@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- ✅ INTERNET PERMISSION -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:allowBackup="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.ApzoLife">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:theme="@style/Theme.ApzoLife"
+            android:windowSoftInputMode="adjustResize">
+            <!--
+                ☝️ THIS is the fix.
+                Without adjustResize, Android uses adjustPan — it slides the
+                entire window upward when the keyboard opens. Compose never
+                receives IME insets, so imePadding() does nothing and content
+                disappears behind the keyboard.
+
+                With adjustResize, Android resizes the window instead.
+                Compose receives the correct IME insets, imePadding() shrinks
+                the layout, and verticalScroll brings the focused field into view.
+            -->
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+        </activity>
+
+    </application>
+
+</manifest>
