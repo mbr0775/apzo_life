@@ -58,9 +58,27 @@ fun ChatScreen(viewModel: ApzoViewModel, onBack: () -> Unit) {
                 },
                 navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.Rounded.ArrowBackIosNew, "Back") } },
                 actions = {
-                    if (state.messages.isNotEmpty()) {
-                        IconButton(onClick = { viewModel.clearChat() }) {
-                            Icon(Icons.Rounded.RestartAlt, "Clear chat")
+                    // Keep the control available during generation so it can cancel
+                    // a request that is stuck or taking too long.
+                    if (state.messages.isNotEmpty() || state.isLoading) {
+                        IconButton(
+                            onClick = {
+                                input = ""
+                                viewModel.clearChat()
+                            }
+                        ) {
+                            Icon(
+                                imageVector = if (state.isLoading) {
+                                    Icons.Rounded.Close
+                                } else {
+                                    Icons.Rounded.RestartAlt
+                                },
+                                contentDescription = if (state.isLoading) {
+                                    "Cancel request"
+                                } else {
+                                    "Clear chat"
+                                }
+                            )
                         }
                     }
                 },
@@ -219,36 +237,81 @@ private fun ChatBubble(turn: AiChatTurn) {
  * dense paragraph: lines starting with "- " become real bullet rows, and
  * **text** becomes bold. Falls back to plain text for anything else.
  */
+private const val UNICODE_BULLET = "\u2022"
+private const val BROKEN_UTF8_BULLET = "\u00E2\u20AC\u00A2"
+private const val DOUBLE_ENCODED_BULLET = "\u00C3\u00A2\u00E2\u0082\u00AC\u00C2\u00A2"
+
+private data class ParsedAiLine(
+    val isBullet: Boolean,
+    val content: String
+)
+
+/**
+ * Detects list markers without drawing a Unicode bullet as text. This avoids
+ * mojibake such as "a-c" / "â€¢" when a source file or provider response is
+ * decoded with the wrong character set.
+ */
+private fun parseAiLine(value: String): ParsedAiLine {
+    val trimmed = value.trim()
+    if (trimmed.isEmpty()) return ParsedAiLine(false, "")
+
+    val prefixes = listOf(
+        "- ",
+        "* ",
+        "$UNICODE_BULLET ",
+        "$BROKEN_UTF8_BULLET ",
+        "$DOUBLE_ENCODED_BULLET "
+    )
+
+    val matchedPrefix = prefixes.firstOrNull { trimmed.startsWith(it) }
+    return if (matchedPrefix != null) {
+        ParsedAiLine(
+            isBullet = true,
+            content = trimmed.removePrefix(matchedPrefix).trim()
+        )
+    } else {
+        ParsedAiLine(isBullet = false, content = trimmed)
+    }
+}
+
+/**
+ * Renders list markers as a small Compose circle rather than as a text glyph.
+ * Therefore the UI remains correct even when the AI returns a broken bullet.
+ */
 @Composable
 private fun FormattedAiText(raw: String) {
     val lines = raw.trim().lines()
+
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
         lines.forEach { line ->
-            val trimmed = line.trim()
-            if (trimmed.isEmpty()) return@forEach
+            val parsed = parseAiLine(line)
+            if (parsed.content.isEmpty()) return@forEach
 
-            val isBullet = trimmed.startsWith("- ") || trimmed.startsWith("• ") || trimmed.startsWith("* ")
-            val content = if (isBullet) trimmed.removePrefix("- ").removePrefix("• ").removePrefix("* ").trim() else trimmed
-
-            if (isBullet) {
-                Row(verticalAlignment = Alignment.Top) {
-                    Text(
-                        "•",
-                        fontSize = 14.sp,
-                        lineHeight = 20.sp,
-                        color = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.padding(end = 8.dp)
+            if (parsed.isBullet) {
+                Row(
+                    verticalAlignment = Alignment.Top,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .padding(top = 7.dp, end = 9.dp)
+                            .size(5.dp)
+                            .background(
+                                color = MaterialTheme.colorScheme.primary,
+                                shape = CircleShape
+                            )
                     )
                     Text(
-                        text = formatInlineMarkdown(content),
+                        text = formatInlineMarkdown(parsed.content),
                         fontSize = 14.sp,
                         lineHeight = 20.sp,
-                        color = MaterialTheme.colorScheme.onSurface
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.weight(1f)
                     )
                 }
             } else {
                 Text(
-                    text = formatInlineMarkdown(content),
+                    text = formatInlineMarkdown(parsed.content),
                     fontSize = 14.sp,
                     lineHeight = 20.sp,
                     fontWeight = FontWeight.Medium,

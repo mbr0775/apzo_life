@@ -11,6 +11,7 @@ import com.google.firebase.ai.type.Schema
 import com.google.firebase.ai.type.Tool
 import com.google.firebase.ai.type.content
 import com.google.firebase.ai.type.generationConfig
+import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
@@ -31,6 +32,50 @@ import kotlinx.serialization.json.jsonObject
 object AiChatService {
 
     private const val TAG = "AiChatAssistant"
+
+    /**
+     * Unlike runCatching, this never converts coroutine cancellation into an
+     * ordinary provider failure. Resetting the chat therefore stops the chain.
+     */
+    private suspend fun <T> providerCall(block: suspend () -> T): Result<T> {
+        return try {
+            Result.success(block())
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            Result.failure(e)
+        }
+    }
+
+
+    /**
+     * Normalizes bullet characters returned by providers before the message is
+     * stored in chat history. ASCII "- " is used as the transport format;
+     * ChatScreen draws the visible bullet itself.
+     */
+    private fun sanitizeAssistantText(value: String): String {
+        val brokenBullet = "\u00E2\u20AC\u00A2"
+        val doubleEncodedBullet = "\u00C3\u00A2\u00E2\u0082\u00AC\u00C2\u00A2"
+
+        return value
+            .replace(doubleEncodedBullet, "-")
+            .replace(brokenBullet, "-")
+            .replace("\u2022", "-")
+            .lines()
+            .joinToString("\n") { line ->
+                val trimmed = line.trimStart()
+                val indentation = line.substring(0, line.length - trimmed.length)
+
+                when {
+                    trimmed.startsWith("-") ->
+                        indentation + "- " + trimmed.drop(1).trimStart()
+                    trimmed.startsWith("*") ->
+                        indentation + "- " + trimmed.drop(1).trimStart()
+                    else -> line
+                }
+            }
+            .trim()
+    }
 
     // NOT const: .trimIndent() is a function call, so this cannot be a
     // compile-time constant. A regular `val` (evaluated once, lazily by the
@@ -103,13 +148,13 @@ object AiChatService {
             tools = listOf(chatTool),
             generationConfig = generationConfig {
                 temperature = 0.4f
-                maxOutputTokens = 700
+                maxOutputTokens = 1400
             }
         )
     }
 
     suspend fun sendMessage(userMessage: String, history: List<AiChatTurn>): Result<String> {
-        val geminiResult = runCatching { callGemini(userMessage, history) }
+        val geminiResult = providerCall { callGemini(userMessage, history) }
         geminiResult.onSuccess { return Result.success(it) }
 
         val geminiError = geminiResult.exceptionOrNull()!!
@@ -117,7 +162,7 @@ object AiChatService {
         if (!isQuotaOrRateLimitError(geminiError)) return Result.failure(geminiError)
 
         Log.i(TAG, "Gemini quota hit, falling back to Groq")
-        val groqResult = runCatching {
+        val groqResult = providerCall {
             callFallback(GROQ_ENDPOINT, BuildConfig.GROQ_API_KEY, GroqClient.DEFAULT_MODEL, userMessage, history)
         }
         groqResult.onSuccess { return Result.success(it) }
@@ -126,7 +171,7 @@ object AiChatService {
         if (!isQuotaOrRateLimitError(groqError)) return Result.failure(groqError)
 
         Log.i(TAG, "Groq quota hit, falling back to Cerebras")
-        val cerebrasResult = runCatching {
+        val cerebrasResult = providerCall {
             callFallback(CEREBRAS_ENDPOINT, BuildConfig.CEREBRAS_API_KEY, CerebrasClient.DEFAULT_MODEL, userMessage, history)
         }
         cerebrasResult.onSuccess { return Result.success(it) }
@@ -135,7 +180,7 @@ object AiChatService {
         if (!isQuotaOrRateLimitError(cerebrasError)) return Result.failure(cerebrasError)
 
         Log.i(TAG, "Cerebras quota hit, falling back to OpenRouter")
-        return runCatching {
+        return providerCall {
             callFallback(
                 OPENROUTER_ENDPOINT, BuildConfig.OPENROUTER_API_KEY, OpenRouterClient.DEFAULT_MODEL,
                 userMessage, history,
@@ -149,7 +194,7 @@ object AiChatService {
         val chatHistory = buildList {
             add(content(role = "user") { text(SYSTEM_PROMPT) })
             add(content(role = "model") { text("Understood - I'll use the tools to check real task data before answering.") })
-            history.forEach { turn ->
+            history.takeLast(12).forEach { turn ->
                 add(content(role = if (turn.role == "user") "user" else "model") { text(turn.text) })
             }
         }
@@ -176,9 +221,24 @@ object AiChatService {
             guard++
         }
 
+        val finishReason = response.candidates
+            .firstOrNull()
+            ?.finishReason
+            ?.toString()
+            .orEmpty()
+
+        if (finishReason.contains("MAX_TOKENS", ignoreCase = true)) {
+            error("MAX_TOKENS: Apzo AI response was cut off before completion.")
+        }
+
         val text = response.text?.trim().orEmpty()
-        if (text.isBlank()) error("Apzo AI returned an empty reply.")
-        return text
+        if (text.isBlank()) {
+            error(
+                "Apzo AI returned an empty reply. " +
+                        "Finish reason: ${finishReason.ifBlank { "unknown" }}"
+            )
+        }
+        return sanitizeAssistantText(text)
     }
 
     // ---- OpenAI-compatible fallback path (Groq / Cerebras / OpenRouter) ----
@@ -191,7 +251,7 @@ object AiChatService {
         extraHeaders: Map<String, String> = emptyMap()
     ): String {
         val messages = mutableListOf(ChatMsg(role = "system", content = SYSTEM_PROMPT))
-        history.forEach { turn ->
+        history.takeLast(12).forEach { turn ->
             messages.add(ChatMsg(role = if (turn.role == "user") "user" else "assistant", content = turn.text))
         }
         messages.add(ChatMsg(role = "user", content = userMessage))
@@ -203,7 +263,7 @@ object AiChatService {
             if (toolCalls.isNullOrEmpty()) {
                 val text = reply.content?.trim().orEmpty()
                 if (text.isBlank()) error("Apzo AI returned an empty reply.")
-                return text
+                return sanitizeAssistantText(text)
             }
 
             messages.add(reply) // assistant message carrying the tool_calls
@@ -232,11 +292,13 @@ object AiChatService {
             msg.contains("network") || msg.contains("unable to resolve host") || msg.contains("timeout") ->
                 "No internet connection. Check your network and try again."
             msg.contains("blocked") || msg.contains("safety") -> "Apzo AI couldn't process that message. Try rephrasing it."
+            msg.contains("max_tokens") || msg.contains("max tokens") ->
+                "Apzo AI response was too long. Try a shorter request."
             msg.contains("quota") || msg.contains("resource_exhausted") || msg.contains("429") || msg.contains("rate limit") ->
                 "Apzo AI is busy right now. Please try again in a moment."
             msg.contains("permission") || msg.contains("unauthenticated") || msg.contains("403") || msg.contains("401") ->
                 "Apzo AI is temporarily unavailable. Please try again later."
-            else -> "DEBUG: ${e.message}" // TODO revert to "Apzo AI failed. Please try again."
+            else -> "Apzo AI failed. Please try again."
         }
     }
 }

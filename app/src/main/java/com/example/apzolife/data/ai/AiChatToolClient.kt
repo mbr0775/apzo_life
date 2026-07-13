@@ -2,6 +2,7 @@ package com.example.apzolife.data.ai
 
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.android.Android
+import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.request.header
 import io.ktor.client.request.post
@@ -63,6 +64,11 @@ object AiChatToolClient {
     private val client by lazy {
         HttpClient(Android) {
             install(ContentNegotiation) { json(json) }
+            install(HttpTimeout) {
+                connectTimeoutMillis = 15_000L
+                requestTimeoutMillis = 40_000L
+                socketTimeoutMillis = 40_000L
+            }
         }
     }
 
@@ -138,7 +144,7 @@ object AiChatToolClient {
         model: String,
         messages: List<ChatMsg>,
         extraHeaders: Map<String, String> = emptyMap(),
-        maxTokens: Int = 700,
+        maxTokens: Int = 1200,
         temperature: Double = 0.4
     ): ChatMsg {
         require(apiKey.isNotBlank()) { "Missing API key for $endpoint" }

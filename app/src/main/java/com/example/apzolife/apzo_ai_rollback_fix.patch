@@ -1,0 +1,341 @@
+--- a/ApzoViewModel.kt
++++ b/ApzoViewModel.kt
+@@ -12,8 +12,12 @@
+ import com.example.apzolife.data.model.SubTask
+ import com.example.apzolife.data.model.TaskStatus
+ import com.example.apzolife.data.repository.ApzoRepository
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.TimeoutCancellationException
+ import kotlinx.coroutines.flow.*
+ import kotlinx.coroutines.launch
++import kotlinx.coroutines.withTimeout
+ import java.util.UUID
+ 
+ data class HomeUiState(
+@@ -81,6 +85,12 @@
+ 
+     private val _chatState = MutableStateFlow(AiChatUiState())
+     val chatState: StateFlow<AiChatUiState> = _chatState.asStateFlow()
++
++    // The active AI request must be cancelled when the user resets the chat.
++    private var chatJob: Job? = null
++
++    // Guards the UI against late responses from an older/cancelled request.
++    private var chatRequestVersion: Long = 0L
+ 
+     init { loadHomeData() }
+ 
+@@ -420,30 +430,86 @@
+         val clean = text.trim()
+         if (clean.isBlank() || _chatState.value.isLoading) return
+ 
+-        viewModelScope.launch {
+-            val priorHistory = _chatState.value.messages
+-            val withUser = priorHistory + AiChatTurn("user", clean)
+-            _chatState.update { it.copy(messages = withUser, isLoading = true, error = null) }
+-
+-            AiChatService.sendMessage(clean, priorHistory)
+-                .onSuccess { reply ->
++        // Cancel any request left from a previous attempt.
++        chatJob?.cancel()
++
++        val requestVersion = ++chatRequestVersion
++        val priorHistory = _chatState.value.messages
++        val withUser = priorHistory + AiChatTurn("user", clean)
++
++        _chatState.value = AiChatUiState(
++            messages = withUser,
++            isLoading = true,
++            error = null
++        )
++
++        chatJob = viewModelScope.launch {
++            try {
++                // Never allow a stalled provider/network request to spin forever.
++                val result = withTimeout(45_000L) {
++                    AiChatService.sendMessage(clean, priorHistory)
++                }
++
++                // Reset may have been pressed while the provider was finishing.
++                if (requestVersion != chatRequestVersion) return@launch
++
++                val failure = result.exceptionOrNull()
++                if (failure != null) {
+                     _chatState.update {
+-                        it.copy(messages = withUser + AiChatTurn("assistant", reply), isLoading = false)
++                        it.copy(
++                            isLoading = false,
++                            error = AiChatService.friendlyErrorMessage(failure)
++                        )
+                     }
+-                    // The assistant may have created tasks/subtasks via function
+-                    // calling, so refresh home data to reflect any changes.
+-                    loadHomeData()
+-                }
+-                .onFailure { e ->
++                    return@launch
++                }
++
++                val reply = result.getOrThrow()
++                _chatState.value = AiChatUiState(
++                    messages = withUser + AiChatTurn("assistant", reply),
++                    isLoading = false,
++                    error = null
++                )
++
++                // Tool calls may have created tasks or subtasks.
++                loadHomeData()
++            } catch (e: TimeoutCancellationException) {
++                if (requestVersion == chatRequestVersion) {
+                     _chatState.update {
+-                        it.copy(isLoading = false, error = AiChatService.friendlyErrorMessage(e))
++                        it.copy(
++                            isLoading = false,
++                            error = "Apzo AI took too long. Please try again."
++                        )
+                     }
+                 }
+-        }
+-    }
+-
+-    /** Clears the chat conversation, e.g. via the reset button on ChatScreen. */
++            } catch (e: CancellationException) {
++                // Expected when reset/cancel is pressed. Do not show an error.
++                throw e
++            } catch (e: Throwable) {
++                if (requestVersion == chatRequestVersion) {
++                    _chatState.update {
++                        it.copy(
++                            isLoading = false,
++                            error = AiChatService.friendlyErrorMessage(e)
++                        )
++                    }
++                }
++            }
++        }
++    }
++
++    /** Cancels the running request and resets the whole conversation. */
+     fun clearChat() {
++        chatRequestVersion++
++        chatJob?.cancel()
++        chatJob = null
+         _chatState.value = AiChatUiState()
+     }
++
++    override fun onCleared() {
++        chatRequestVersion++
++        chatJob?.cancel()
++        chatJob = null
++        super.onCleared()
++    }
+ }
+--- a/ChatScreen.kt
++++ b/ChatScreen.kt
+@@ -58,9 +58,27 @@
+                 },
+                 navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.Rounded.ArrowBackIosNew, "Back") } },
+                 actions = {
+-                    if (state.messages.isNotEmpty()) {
+-                        IconButton(onClick = { viewModel.clearChat() }) {
+-                            Icon(Icons.Rounded.RestartAlt, "Clear chat")
++                    // Keep the control available during generation so it can cancel
++                    // a request that is stuck or taking too long.
++                    if (state.messages.isNotEmpty() || state.isLoading) {
++                        IconButton(
++                            onClick = {
++                                input = ""
++                                viewModel.clearChat()
++                            }
++                        ) {
++                            Icon(
++                                imageVector = if (state.isLoading) {
++                                    Icons.Rounded.Close
++                                } else {
++                                    Icons.Rounded.RestartAlt
++                                },
++                                contentDescription = if (state.isLoading) {
++                                    "Cancel request"
++                                } else {
++                                    "Clear chat"
++                                }
++                            )
+                         }
+                     }
+                 },
+--- a/AiChatService.kt
++++ b/AiChatService.kt
+@@ -11,6 +11,7 @@
+ import com.google.firebase.ai.type.Tool
+ import com.google.firebase.ai.type.content
+ import com.google.firebase.ai.type.generationConfig
++import kotlinx.coroutines.CancellationException
+ import kotlinx.serialization.json.Json
+ import kotlinx.serialization.json.JsonObject
+ import kotlinx.serialization.json.buildJsonObject
+@@ -32,6 +33,20 @@
+ 
+     private const val TAG = "AiChatAssistant"
+ 
++    /**
++     * Unlike runCatching, this never converts coroutine cancellation into an
++     * ordinary provider failure. Resetting the chat therefore stops the chain.
++     */
++    private suspend fun <T> providerCall(block: suspend () -> T): Result<T> {
++        return try {
++            Result.success(block())
++        } catch (e: CancellationException) {
++            throw e
++        } catch (e: Throwable) {
++            Result.failure(e)
++        }
++    }
++
+     // NOT const: .trimIndent() is a function call, so this cannot be a
+     // compile-time constant. A regular `val` (evaluated once, lazily by the
+     // object's init) is what we want here.
+@@ -103,13 +118,13 @@
+             tools = listOf(chatTool),
+             generationConfig = generationConfig {
+                 temperature = 0.4f
+-                maxOutputTokens = 700
++                maxOutputTokens = 1400
+             }
+         )
+     }
+ 
+     suspend fun sendMessage(userMessage: String, history: List<AiChatTurn>): Result<String> {
+-        val geminiResult = runCatching { callGemini(userMessage, history) }
++        val geminiResult = providerCall { callGemini(userMessage, history) }
+         geminiResult.onSuccess { return Result.success(it) }
+ 
+         val geminiError = geminiResult.exceptionOrNull()!!
+@@ -117,7 +132,7 @@
+         if (!isQuotaOrRateLimitError(geminiError)) return Result.failure(geminiError)
+ 
+         Log.i(TAG, "Gemini quota hit, falling back to Groq")
+-        val groqResult = runCatching {
++        val groqResult = providerCall {
+             callFallback(GROQ_ENDPOINT, BuildConfig.GROQ_API_KEY, GroqClient.DEFAULT_MODEL, userMessage, history)
+         }
+         groqResult.onSuccess { return Result.success(it) }
+@@ -126,7 +141,7 @@
+         if (!isQuotaOrRateLimitError(groqError)) return Result.failure(groqError)
+ 
+         Log.i(TAG, "Groq quota hit, falling back to Cerebras")
+-        val cerebrasResult = runCatching {
++        val cerebrasResult = providerCall {
+             callFallback(CEREBRAS_ENDPOINT, BuildConfig.CEREBRAS_API_KEY, CerebrasClient.DEFAULT_MODEL, userMessage, history)
+         }
+         cerebrasResult.onSuccess { return Result.success(it) }
+@@ -135,7 +150,7 @@
+         if (!isQuotaOrRateLimitError(cerebrasError)) return Result.failure(cerebrasError)
+ 
+         Log.i(TAG, "Cerebras quota hit, falling back to OpenRouter")
+-        return runCatching {
++        return providerCall {
+             callFallback(
+                 OPENROUTER_ENDPOINT, BuildConfig.OPENROUTER_API_KEY, OpenRouterClient.DEFAULT_MODEL,
+                 userMessage, history,
+@@ -149,7 +164,7 @@
+         val chatHistory = buildList {
+             add(content(role = "user") { text(SYSTEM_PROMPT) })
+             add(content(role = "model") { text("Understood - I'll use the tools to check real task data before answering.") })
+-            history.forEach { turn ->
++            history.takeLast(12).forEach { turn ->
+                 add(content(role = if (turn.role == "user") "user" else "model") { text(turn.text) })
+             }
+         }
+@@ -176,8 +191,23 @@
+             guard++
+         }
+ 
++        val finishReason = response.candidates
++            .firstOrNull()
++            ?.finishReason
++            ?.toString()
++            .orEmpty()
++
++        if (finishReason.contains("MAX_TOKENS", ignoreCase = true)) {
++            error("MAX_TOKENS: Apzo AI response was cut off before completion.")
++        }
++
+         val text = response.text?.trim().orEmpty()
+-        if (text.isBlank()) error("Apzo AI returned an empty reply.")
++        if (text.isBlank()) {
++            error(
++                "Apzo AI returned an empty reply. " +
++                    "Finish reason: ${finishReason.ifBlank { "unknown" }}"
++            )
++        }
+         return text
+     }
+ 
+@@ -191,7 +221,7 @@
+         extraHeaders: Map<String, String> = emptyMap()
+     ): String {
+         val messages = mutableListOf(ChatMsg(role = "system", content = SYSTEM_PROMPT))
+-        history.forEach { turn ->
++        history.takeLast(12).forEach { turn ->
+             messages.add(ChatMsg(role = if (turn.role == "user") "user" else "assistant", content = turn.text))
+         }
+         messages.add(ChatMsg(role = "user", content = userMessage))
+@@ -232,11 +262,13 @@
+             msg.contains("network") || msg.contains("unable to resolve host") || msg.contains("timeout") ->
+                 "No internet connection. Check your network and try again."
+             msg.contains("blocked") || msg.contains("safety") -> "Apzo AI couldn't process that message. Try rephrasing it."
++            msg.contains("max_tokens") || msg.contains("max tokens") ->
++                "Apzo AI response was too long. Try a shorter request."
+             msg.contains("quota") || msg.contains("resource_exhausted") || msg.contains("429") || msg.contains("rate limit") ->
+                 "Apzo AI is busy right now. Please try again in a moment."
+             msg.contains("permission") || msg.contains("unauthenticated") || msg.contains("403") || msg.contains("401") ->
+                 "Apzo AI is temporarily unavailable. Please try again later."
+-            else -> "DEBUG: ${e.message}" // TODO revert to "Apzo AI failed. Please try again."
++            else -> "Apzo AI failed. Please try again."
+         }
+     }
+ }
+--- a/AiChatToolClient.kt
++++ b/AiChatToolClient.kt
+@@ -2,6 +2,7 @@
+ 
+ import io.ktor.client.HttpClient
+ import io.ktor.client.engine.android.Android
++import io.ktor.client.plugins.HttpTimeout
+ import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
+ import io.ktor.client.request.header
+ import io.ktor.client.request.post
+@@ -63,6 +64,11 @@
+     private val client by lazy {
+         HttpClient(Android) {
+             install(ContentNegotiation) { json(json) }
++            install(HttpTimeout) {
++                connectTimeoutMillis = 15_000L
++                requestTimeoutMillis = 40_000L
++                socketTimeoutMillis = 40_000L
++            }
+         }
+     }
+ 
+@@ -138,7 +144,7 @@
+         model: String,
+         messages: List<ChatMsg>,
+         extraHeaders: Map<String, String> = emptyMap(),
+-        maxTokens: Int = 700,
++        maxTokens: Int = 1200,
+         temperature: Double = 0.4
+     ): ChatMsg {
+         require(apiKey.isNotBlank()) { "Missing API key for $endpoint" }
+--- a/AiQuotaUtils.kt
++++ b/AiQuotaUtils.kt
+@@ -12,5 +12,8 @@
+             msg.contains("resource_exhausted") ||
+             msg.contains("429") ||
+             msg.contains("rate limit") ||
+-            msg.contains("rate_limit")
++            msg.contains("rate_limit") ||
++            msg.contains("max_tokens") ||
++            msg.contains("max tokens") ||
++            msg.contains("content generation stopped")
+ }

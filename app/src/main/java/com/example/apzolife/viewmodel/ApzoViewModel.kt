@@ -12,8 +12,12 @@ import com.example.apzolife.data.model.MainTask
 import com.example.apzolife.data.model.SubTask
 import com.example.apzolife.data.model.TaskStatus
 import com.example.apzolife.data.repository.ApzoRepository
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 import java.util.UUID
 
 data class HomeUiState(
@@ -81,6 +85,12 @@ class ApzoViewModel : ViewModel() {
 
     private val _chatState = MutableStateFlow(AiChatUiState())
     val chatState: StateFlow<AiChatUiState> = _chatState.asStateFlow()
+
+    // The active AI request must be cancelled when the user resets the chat.
+    private var chatJob: Job? = null
+
+    // Guards the UI against late responses from an older/cancelled request.
+    private var chatRequestVersion: Long = 0L
 
     init { loadHomeData() }
 
@@ -331,11 +341,11 @@ class ApzoViewModel : ViewModel() {
         }
     }
 
-    // ── AI Daily Planner ──────────────────────────────────────────────
+    // â”€â”€ AI Daily Planner â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /**
      * Asks Gemini to order today's PENDING tasks into a schedule.
-     * Only today's pending tasks are sent — not full history — for
+     * Only today's pending tasks are sent â€” not full history â€” for
      * speed, cost, and privacy.
      */
     fun planMyDay() {
@@ -373,7 +383,7 @@ class ApzoViewModel : ViewModel() {
         _dailyPlanState.value = DailyPlanUiState()
     }
 
-    // ── AI Insights Coach ─────────────────────────────────────────────
+    // â”€â”€ AI Insights Coach â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /**
      * Asks the AI to turn the last 7 days of task activity into a short
@@ -408,7 +418,7 @@ class ApzoViewModel : ViewModel() {
         _insightsState.value = AiInsightsUiState()
     }
 
-    // ── Ask Apzo AI (chat assistant with function calling) ─────────────
+    // â”€â”€ Ask Apzo AI (chat assistant with function calling) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /**
      * Sends a user message to Apzo AI. History is passed as it was BEFORE
@@ -420,30 +430,86 @@ class ApzoViewModel : ViewModel() {
         val clean = text.trim()
         if (clean.isBlank() || _chatState.value.isLoading) return
 
-        viewModelScope.launch {
-            val priorHistory = _chatState.value.messages
-            val withUser = priorHistory + AiChatTurn("user", clean)
-            _chatState.update { it.copy(messages = withUser, isLoading = true, error = null) }
+        // Cancel any request left from a previous attempt.
+        chatJob?.cancel()
 
-            AiChatService.sendMessage(clean, priorHistory)
-                .onSuccess { reply ->
-                    _chatState.update {
-                        it.copy(messages = withUser + AiChatTurn("assistant", reply), isLoading = false)
-                    }
-                    // The assistant may have created tasks/subtasks via function
-                    // calling, so refresh home data to reflect any changes.
-                    loadHomeData()
+        val requestVersion = ++chatRequestVersion
+        val priorHistory = _chatState.value.messages
+        val withUser = priorHistory + AiChatTurn("user", clean)
+
+        _chatState.value = AiChatUiState(
+            messages = withUser,
+            isLoading = true,
+            error = null
+        )
+
+        chatJob = viewModelScope.launch {
+            try {
+                // Never allow a stalled provider/network request to spin forever.
+                val result = withTimeout(45_000L) {
+                    AiChatService.sendMessage(clean, priorHistory)
                 }
-                .onFailure { e ->
+
+                // Reset may have been pressed while the provider was finishing.
+                if (requestVersion != chatRequestVersion) return@launch
+
+                val failure = result.exceptionOrNull()
+                if (failure != null) {
                     _chatState.update {
-                        it.copy(isLoading = false, error = AiChatService.friendlyErrorMessage(e))
+                        it.copy(
+                            isLoading = false,
+                            error = AiChatService.friendlyErrorMessage(failure)
+                        )
+                    }
+                    return@launch
+                }
+
+                val reply = result.getOrThrow()
+                _chatState.value = AiChatUiState(
+                    messages = withUser + AiChatTurn("assistant", reply),
+                    isLoading = false,
+                    error = null
+                )
+
+                // Tool calls may have created tasks or subtasks.
+                loadHomeData()
+            } catch (e: TimeoutCancellationException) {
+                if (requestVersion == chatRequestVersion) {
+                    _chatState.update {
+                        it.copy(
+                            isLoading = false,
+                            error = "Apzo AI took too long. Please try again."
+                        )
                     }
                 }
+            } catch (e: CancellationException) {
+                // Expected when reset/cancel is pressed. Do not show an error.
+                throw e
+            } catch (e: Throwable) {
+                if (requestVersion == chatRequestVersion) {
+                    _chatState.update {
+                        it.copy(
+                            isLoading = false,
+                            error = AiChatService.friendlyErrorMessage(e)
+                        )
+                    }
+                }
+            }
         }
     }
 
-    /** Clears the chat conversation, e.g. via the reset button on ChatScreen. */
+    /** Cancels the running request and resets the whole conversation. */
     fun clearChat() {
+        chatRequestVersion++
+        chatJob?.cancel()
+        chatJob = null
         _chatState.value = AiChatUiState()
+    }
+
+    override fun onCleared() {
+        chatRequestVersion++
+        chatJob?.cancel()
+        chatJob = null
+        super.onCleared()
     }
 }
