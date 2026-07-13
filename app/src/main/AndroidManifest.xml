@@ -2,10 +2,14 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- ✅ INTERNET PERMISSION -->
+    <!-- INTERNET PERMISSION -->
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- ACCESS_NETWORK_STATE — required by NetworkMonitor -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
     <application
+        android:name=".ApzoApplication"
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
@@ -22,15 +26,9 @@
             android:theme="@style/Theme.ApzoLife"
             android:windowSoftInputMode="adjustResize">
             <!--
-                ☝️ THIS is the fix.
-                Without adjustResize, Android uses adjustPan — it slides the
-                entire window upward when the keyboard opens. Compose never
-                receives IME insets, so imePadding() does nothing and content
-                disappears behind the keyboard.
-
-                With adjustResize, Android resizes the window instead.
-                Compose receives the correct IME insets, imePadding() shrinks
-                the layout, and verticalScroll brings the focused field into view.
+                adjustResize: Android resizes the window when the keyboard opens.
+                Compose receives correct IME insets, imePadding() shrinks the
+                layout, and verticalScroll brings the focused field into view.
             -->
 
             <intent-filter>

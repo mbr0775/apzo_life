@@ -8,13 +8,14 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.navArgument
 import com.example.apzolife.data.repository.AuthRepository
+import com.example.apzolife.ui.screens.analytics.AnalyticsScreen
 import com.example.apzolife.ui.screens.auth.ForgotPasswordScreen
 import com.example.apzolife.ui.screens.auth.LoginScreen
 import com.example.apzolife.ui.screens.auth.SignupScreen
 import com.example.apzolife.ui.screens.calendar.CalendarScreen
+import com.example.apzolife.ui.screens.chat.ChatScreen
 import com.example.apzolife.ui.screens.completed.CompletedScreen
 import com.example.apzolife.ui.screens.home.HomeScreen
-import com.example.apzolife.ui.screens.insight.InsightScreen
 import com.example.apzolife.ui.screens.settings.SettingsScreen
 import com.example.apzolife.ui.screens.task.AddTaskScreen
 import com.example.apzolife.ui.screens.task.EditTaskScreen
@@ -28,11 +29,11 @@ sealed class Screen(val route: String) {
     object ForgotPassword : Screen("forgot_password")
     object Home           : Screen("home")
     object Calendar       : Screen("calendar")
-    object Insights       : Screen("insights")
+    object Analytics      : Screen("analytics")
     object Completed      : Screen("completed")
     object Settings       : Screen("settings")
     object AddTask        : Screen("add_task")
-
+    object Chat            : Screen("ai_chat")
     object TaskDetail : Screen("task_detail/{taskId}") {
         fun createRoute(taskId: String) = "task_detail/$taskId"
     }
@@ -45,11 +46,9 @@ sealed class Screen(val route: String) {
 fun ApzoNavGraph(navController: NavHostController) {
     val viewModel: ApzoViewModel = viewModel()
     val authViewModel: AuthViewModel = viewModel()
+    val start = if (AuthRepository.isLoggedIn()) Screen.Home.route else Screen.Login.route
 
-    val startDestination = if (AuthRepository.isLoggedIn()) Screen.Home.route else Screen.Login.route
-
-    NavHost(navController = navController, startDestination = startDestination) {
-
+    NavHost(navController = navController, startDestination = start) {
         composable(Screen.Login.route) {
             LoginScreen(
                 onLoginSuccess = {
@@ -63,96 +62,81 @@ fun ApzoNavGraph(navController: NavHostController) {
                 viewModel = authViewModel
             )
         }
-
         composable(Screen.Signup.route) {
-            SignupScreen(
-                onBackToLogin = { navController.popBackStack() },
-                viewModel = authViewModel
-            )
+            SignupScreen(onBackToLogin = { navController.popBackStack() }, viewModel = authViewModel)
         }
-
         composable(Screen.ForgotPassword.route) {
-            ForgotPasswordScreen(
-                onBack = { navController.popBackStack() },
-                viewModel = authViewModel
-            )
+            ForgotPasswordScreen(onBack = { navController.popBackStack() }, viewModel = authViewModel)
         }
-
         composable(Screen.Home.route) {
             HomeScreen(
                 viewModel = viewModel,
                 onAddTask = { navController.navigate(Screen.AddTask.route) },
-                onTaskClick = { taskId -> navController.navigate(Screen.TaskDetail.createRoute(taskId)) }
+                onTaskClick = { navController.navigate(Screen.TaskDetail.createRoute(it)) },
+                onOpenChat = { navController.navigate(Screen.Chat.route) }
             )
         }
-
         composable(Screen.Calendar.route) {
             CalendarScreen(
                 viewModel = viewModel,
-                onTaskClick = { taskId -> navController.navigate(Screen.TaskDetail.createRoute(taskId)) }
+                onTaskClick = { navController.navigate(Screen.TaskDetail.createRoute(it)) }
             )
         }
-
-        composable(Screen.Insights.route) {
-            InsightScreen(viewModel = viewModel)
+        composable(Screen.Analytics.route) {
+            AnalyticsScreen(
+                viewModel = viewModel,
+                onTaskClick = { navController.navigate(Screen.TaskDetail.createRoute(it)) }
+            )
         }
-
         composable(Screen.Completed.route) {
             CompletedScreen(
                 viewModel = viewModel,
-                onTaskClick = { taskId -> navController.navigate(Screen.TaskDetail.createRoute(taskId)) }
+                onTaskClick = { navController.navigate(Screen.TaskDetail.createRoute(it)) }
             )
         }
-
         composable(Screen.Settings.route) {
             SettingsScreen(
                 authViewModel = authViewModel,
                 onLoggedOut = {
                     navController.navigate(Screen.Login.route) {
-                        popUpTo(0) { inclusive = true }
-                        launchSingleTop = true
+                        popUpTo(0) { inclusive = true }; launchSingleTop = true
                     }
                 }
             )
         }
-
         composable(Screen.AddTask.route) {
             AddTaskScreen(
                 viewModel = viewModel,
                 onBack = { navController.popBackStack() },
-                onTaskCreated = {
-                    viewModel.loadHomeData()
-                    navController.popBackStack()
-                }
+                onTaskCreated = { viewModel.loadHomeData(); navController.popBackStack() }
             )
         }
-
-        composable(
-            route = Screen.TaskDetail.route,
-            arguments = listOf(navArgument("taskId") { type = NavType.StringType })
-        ) { backStackEntry ->
-            val taskId = backStackEntry.arguments?.getString("taskId") ?: return@composable
-            TaskDetailScreen(
-                taskId = taskId,
+        composable(Screen.Chat.route) {
+            ChatScreen(
                 viewModel = viewModel,
+                onBack = { navController.popBackStack() }
+            )
+        }
+        composable(
+            Screen.TaskDetail.route,
+            arguments = listOf(navArgument("taskId") { type = NavType.StringType })
+        ) { back ->
+            val taskId = back.arguments?.getString("taskId") ?: return@composable
+            TaskDetailScreen(
+                taskId = taskId, viewModel = viewModel,
                 onBack = { navController.popBackStack() },
                 onEdit = { navController.navigate(Screen.EditTask.createRoute(taskId)) }
             )
         }
-
         composable(
-            route = Screen.EditTask.route,
+            Screen.EditTask.route,
             arguments = listOf(navArgument("taskId") { type = NavType.StringType })
-        ) { backStackEntry ->
-            val taskId = backStackEntry.arguments?.getString("taskId") ?: return@composable
+        ) { back ->
+            val taskId = back.arguments?.getString("taskId") ?: return@composable
             EditTaskScreen(
-                taskId = taskId,
-                viewModel = viewModel,
+                taskId = taskId, viewModel = viewModel,
                 onBack = { navController.popBackStack() },
-                onSaved = {
-                    viewModel.loadHomeData()
-                    navController.popBackStack()
-                }
+                onSaved = { viewModel.loadHomeData(); navController.popBackStack() }
             )
         }
     }

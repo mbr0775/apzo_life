@@ -3,14 +3,12 @@ package com.example.apzolife.viewmodel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.apzolife.data.repository.AuthRepository
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 
 data class AuthUiState(
     val isLoading: Boolean = false,
-    val isLoggedIn: Boolean = AuthRepository.isLoggedIn(),
+    val isLoggedIn: Boolean = false,
     val error: String? = null,
     val message: String? = null,
     val rememberMe: Boolean = false,
@@ -22,61 +20,52 @@ class AuthViewModel : ViewModel() {
     private val _uiState = MutableStateFlow(AuthUiState())
     val uiState: StateFlow<AuthUiState> = _uiState.asStateFlow()
 
-    fun setRememberMe(value: Boolean) {
-        _uiState.value = _uiState.value.copy(rememberMe = value)
-    }
-
     fun login(email: String, password: String) {
         viewModelScope.launch {
-            _uiState.value = _uiState.value.copy(isLoading = true, error = null, message = null)
-            val result = AuthRepository.login(
-                email = email,
-                password = password,
-                rememberMe = _uiState.value.rememberMe
-            )
-            _uiState.value = if (result.isSuccess) {
-                _uiState.value.copy(isLoading = false, isLoggedIn = true, message = "Login successful")
-            } else {
-                _uiState.value.copy(isLoading = false, error = result.exceptionOrNull()?.message ?: "Login failed")
-            }
+            _uiState.update { it.copy(isLoading = true, error = null) }
+            AuthRepository.login(email, password, _uiState.value.rememberMe)
+                .onSuccess {
+                    _uiState.update { it.copy(isLoading = false, isLoggedIn = true) }
+                }
+                .onFailure { e ->
+                    _uiState.update { it.copy(isLoading = false, error = e.message ?: "Login failed") }
+                }
         }
     }
 
     fun signup(fullName: String, email: String, password: String) {
         viewModelScope.launch {
-            _uiState.value = _uiState.value.copy(isLoading = true, error = null, message = null)
-            val result = AuthRepository.signup(fullName, email, password)
-            _uiState.value = if (result.isSuccess) {
-                _uiState.value.copy(
-                    isLoading = false,
-                    message = "Account created successfully. Check your email if confirmation is enabled."
-                )
-            } else {
-                _uiState.value.copy(isLoading = false, error = result.exceptionOrNull()?.message ?: "Signup failed")
-            }
+            _uiState.update { it.copy(isLoading = true, error = null) }
+            AuthRepository.signup(fullName, email, password)
+                .onSuccess {
+                    _uiState.update { it.copy(isLoading = false, message = "Account created! Please verify your email.") }
+                }
+                .onFailure { e ->
+                    _uiState.update { it.copy(isLoading = false, error = e.message ?: "Signup failed") }
+                }
         }
     }
 
     fun sendReset(email: String) {
         viewModelScope.launch {
-            _uiState.value = _uiState.value.copy(isLoading = true, error = null, message = null)
-            val result = AuthRepository.sendReset(email)
-            _uiState.value = if (result.isSuccess) {
-                _uiState.value.copy(isLoading = false, message = "Password reset email sent")
-            } else {
-                _uiState.value.copy(isLoading = false, error = result.exceptionOrNull()?.message ?: "Failed to send reset email")
-            }
+            _uiState.update { it.copy(isLoading = true, error = null) }
+            AuthRepository.sendReset(email)
+                .onSuccess {
+                    _uiState.update { it.copy(isLoading = false, message = "Reset link sent to your email") }
+                }
+                .onFailure { e ->
+                    _uiState.update { it.copy(isLoading = false, error = e.message ?: "Failed to send reset email") }
+                }
         }
     }
 
     fun logout() {
         viewModelScope.launch {
             AuthRepository.logout()
-            _uiState.value = AuthUiState(isLoggedIn = false, savedEmail = "")
         }
     }
 
-    fun clearStatus() {
-        _uiState.value = _uiState.value.copy(error = null, message = null)
+    fun setRememberMe(value: Boolean) {
+        _uiState.update { it.copy(rememberMe = value) }
     }
 }

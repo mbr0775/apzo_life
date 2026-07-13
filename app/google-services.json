@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "965846667012",
+    "project_id": "apzo-life",
+    "storage_bucket": "apzo-life.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:965846667012:android:04425a643cbccd0b740a51",
+        "android_client_info": {
+          "package_name": "com.example.apzolife"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyB-_e0wH7DMkdimC9_Lq5bS-7JbZfecjqw"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
